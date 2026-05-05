@@ -1,0 +1,27 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /lab
+
+COPY lib_bin2png/requirements.txt /tmp/lib_bin2png-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/lib_bin2png-requirements.txt
+
+COPY lib_bin2png/ /lab/lib_bin2png/
+COPY worker/ /lab/worker/
+COPY server.py /lab/server.py
+
+RUN mkdir -p /lab/data \
+    && useradd --create-home --shell /usr/sbin/nologin analyst \
+    && chown -R analyst:analyst /lab/data
+
+USER analyst
+
+EXPOSE 8000
+
+ENTRYPOINT ["python", "/lab/server.py"]

@@ -1,0 +1,6 @@
+
+  {
+    "algorithms": ["markov", "simhash", "bigram_dct", "bin2rgb", "wem"],
+    "input_dir": "C:\\Users\\ADOLF\\Desktop\\Repositorios\\binarios"
+  }
+   

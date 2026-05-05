@@ -1,0 +1,27 @@
+The algorithms that were implemented are:
+
+1. DCT (Discrete Cosine Transform)
+   Paper "Malware Detection Using Frequency Domain-Based Image Visualization and Deep Learning"
+         Tajuddin Manhar Mohammed, Lakshmanan Nataraj, Satish Chikkagoudar, Shivkumar Chandrasekaran, B.S. Manjunath
+   doi: https://doi.org/10.48550/arXiv.2101.10578
+   Algoritmo
+        The executable binaries are represented as grayscale images obtained from the count of N-grams (N=2) of bytes 
+        in the Discrete Cosine Transform (DCT) domain.
+
+2. Bin2rgb
+   Algoritm to encode binary files to PNG images using a tuple ()
+   https://github.com/ESultanik/bin2png/tree/master
+
+3. SimHash
+   Paper "Malware identification using visualization images and deep learning"
+   doi: https://doi.org/10.1016/j.cose.2018.04.005
+
+4. Byte-markov
+   Paper "Byte-level malware classification based on markov images and deep learning"
+   doi: https://doi.org/10.1016/j.cose.2020.101740
+
+5. WEM (Window Entropy Map) 
+   Paper "Comparative Analysis of Low-Dimensional Features and Tree-Based Ensembles for Malware Detection Systems"
+   doi: https://doi.org/10.1109/ACCESS.2020.2986014
+
+-----------------------------------------------------------------

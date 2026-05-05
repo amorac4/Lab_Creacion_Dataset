@@ -1,0 +1,5 @@
+data/
+lib_bin2png/Images/
+lib_bin2png/Images.bkp/
+lib_bin2png/__pycache__/
+*.pyc

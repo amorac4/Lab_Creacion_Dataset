@@ -2,27 +2,22 @@
 .env
 .env.*
 !.env.example
-data/config.json
 
-# Runtime state
-data/jobs.json
-data/virushare_usage.json
-data/*.log
-data/**/worker.log
-data/**/metadata.json
-data/**/archive/
-data/**/binary/
-data/**/work/
+# Local lab output. Keep the folder, never track generated lots/results.
+data/*
+!data/.gitkeep
 
 # Python cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+*.egg-info/
 
 # OS/editor noise
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
-# Generated images are intentionally allowed:
-# data/<batch>/<hash>/images/**/*.png

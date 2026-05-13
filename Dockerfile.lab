@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 unzip \
+    && apt-get install -y --no-install-recommends binutils file libgl1 libglib2.0-0 libimage-exiftool-perl unzip yara \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /lab

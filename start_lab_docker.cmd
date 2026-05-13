@@ -9,6 +9,11 @@ if exist ".env" (
 )
 
 if "%VIRUSHARE_INTERVAL_SECONDS%"=="" set "VIRUSHARE_INTERVAL_SECONDS=16"
+set "MSYS_NO_PATHCONV=1"
+set "MSYS2_ARG_CONV_EXCL=*"
+set "DATA_VOLUME=%cd%\data"
+
+if not exist "%DATA_VOLUME%" mkdir "%DATA_VOLUME%"
 
 docker build -f Dockerfile.lab -t lab-creacion-dataset:local .
 
@@ -18,5 +23,5 @@ docker run --name lab-creacion-dataset-ui ^
   -e "VIRUSHARE_API_KEY=%VIRUSHARE_API_KEY%" ^
   -e "VIRUSHARE_INTERVAL_SECONDS=%VIRUSHARE_INTERVAL_SECONDS%" ^
   -e "VIRUSHARE_URL_TEMPLATE=%VIRUSHARE_URL_TEMPLATE%" ^
-  -v "%cd%\data:/lab/data" ^
+  --mount "type=bind,source=%DATA_VOLUME%,target=/lab/data" ^
   lab-creacion-dataset:local

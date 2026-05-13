@@ -230,6 +230,62 @@ def collect_images(job: dict) -> list[str]:
     ]
 
 
+def collect_analysis(job: dict) -> dict | None:
+    sample_dir = job_sample_dir(job)
+    path = sample_dir / "analysis" / "static_analysis.json"
+    if not path.exists():
+        return None
+    artifact = f"/artifacts/{path.relative_to(DATA_DIR).as_posix()}"
+    try:
+        analysis = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"artifact": artifact, "error": str(exc)}
+
+    identification = analysis.get("identification") or {}
+    byte_profile = analysis.get("byte_profile") or {}
+    strings = analysis.get("strings") or {}
+    pe = analysis.get("pe") or {}
+    elf = analysis.get("elf") or {}
+    exiftool = analysis.get("exiftool") or {}
+    exiftool_parsed = exiftool.get("parsed") or {}
+    iocs = analysis.get("iocs") or {}
+    pdf = analysis.get("pdf") or {}
+    yara = analysis.get("yara") or {}
+    file_result = identification.get("file") or {}
+    mime_result = identification.get("mime") or {}
+    create_date = exiftool_parsed.get("CreateDate") or exiftool_parsed.get("CreationDate")
+    ioc_counts = iocs.get("counts") or {}
+    return {
+        "artifact": artifact,
+        "summary": {
+            "size_bytes": byte_profile.get("size_bytes"),
+            "entropy": byte_profile.get("entropy"),
+            "printable_ratio": byte_profile.get("printable_ratio"),
+            "file_type": file_result.get("stdout", "").strip(),
+            "mime_type": mime_result.get("stdout", "").strip(),
+            "md5": (analysis.get("hashes") or {}).get("md5"),
+            "sha1": (analysis.get("hashes") or {}).get("sha1"),
+            "sha256": (analysis.get("hashes") or {}).get("sha256"),
+            "strings_total": strings.get("total_found"),
+            "strings_stored": len(strings.get("values") or []),
+            "is_pe": pe.get("is_pe"),
+            "timestamp": pe.get("timestamp"),
+            "create_date": create_date,
+            "date_source": "ExifTool CreateDate" if create_date else ("PE timestamp" if pe.get("timestamp") else None),
+            "pe_sections": len(pe.get("sections") or []),
+            "pe_import_dlls": len(pe.get("imports") or []),
+            "is_elf": elf.get("is_elf"),
+            "exiftool_available": exiftool.get("available"),
+            "ioc_total": sum(value for value in ioc_counts.values() if isinstance(value, int)),
+            "ioc_counts": ioc_counts,
+            "is_pdf": pdf.get("is_pdf"),
+            "pdf_risk_flags": pdf.get("risk_flags") or [],
+            "yara_match_count": yara.get("match_count", 0),
+            "yara_matches": [match.get("rule") for match in (yara.get("matches") or [])],
+        },
+    }
+
+
 def has_sample_results(job: dict) -> bool:
     sample_dir = job_sample_dir(job)
     metadata_path = sample_dir / "metadata.json"
@@ -490,6 +546,11 @@ def page() -> str:
     input[type=checkbox]{width:auto;height:auto;margin:0}
     .details{margin-top:18px}.images{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:10px;margin-top:10px}
     .images img{width:100%;aspect-ratio:1/1;object-fit:contain;border:1px solid #d8dde5;border-radius:6px;background:#fafafa}
+    .analysis{margin-top:16px;border-top:1px solid #d8dde5;padding-top:14px}
+    .analysis-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin:10px 0}
+    .analysis-grid div{border:1px solid #d8dde5;border-radius:6px;background:#fafafa;padding:8px;min-width:0}
+    .analysis-grid span{display:block;color:#667085;font-size:12px;text-transform:uppercase}
+    .analysis-grid strong{display:block;margin-top:3px;overflow-wrap:anywhere}
     .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}
     .metric{border:1px solid #d8dde5;border-radius:6px;padding:10px;background:#fafafa}
     .metric span{display:block;color:#667085;font-size:12px;text-transform:uppercase}
@@ -533,6 +594,7 @@ def page() -> str:
   <script>
     const jobsEl=document.querySelector('#jobs'),detailsEl=document.querySelector('#details'),summaryEl=document.querySelector('#batchSummary'),submit=document.querySelector('#submit'),hint=document.querySelector('#submitHint'),jobsHint=document.querySelector('#jobsHint'),optionsHint=document.querySelector('#optionsHint'),existingBatch=document.querySelector('#existingBatch'),batchName=document.querySelector('#batchName');let selectedJobId=null;
     async function api(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error(await r.text());return r.json()}
+    function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
     function pill(s){return '<span class="pill '+s+'">'+s+'</span>'}
     async function refreshConfig(){const d=await api('/api/config');document.querySelector('#configStatus').textContent=(d.has_virushare_api_key?'VirusShare API key configurada.':'VirusShare API key no configurada.')+' Intervalo: '+d.virushare_interval_seconds+'s.';document.querySelector('#skipProcessedHash').checked=!!d.skip_processed_hash;const selected=new Set(d.selected_image_algorithms||[]);document.querySelectorAll('.imageAlgorithm').forEach(c=>{c.checked=selected.has(c.dataset.algorithm)})}
     async function refreshBatches(){const d=await api('/api/batches');const selected=existingBatch.value;existingBatch.innerHTML='<option value="">Crear lote nuevo</option>'+d.batches.map(b=>'<option value="'+b.name+'">'+b.name+'</option>').join('');existingBatch.value=selected}
@@ -549,7 +611,11 @@ def page() -> str:
     async function refresh(){const d=await api('/api/jobs');renderSummary(d.batch_summary);if(!d.jobs.length){jobsEl.innerHTML='<p class="hint">Sin trabajos todavia.</p>';detailsEl.innerHTML='';return}
       jobsEl.innerHTML='<table><thead><tr><th>Lote</th><th>Hash</th><th>Estado</th><th>Imagenes</th><th>Actualizado</th></tr></thead><tbody>'+d.jobs.map(j=>'<tr><td>'+((j.batch_name||j.batch_dir)||'-')+'</td><td><a href="#" data-job-id="'+j.id+'"><code>'+j.hash+'</code></a></td><td>'+pill(j.status)+'</td><td>'+j.image_count+'</td><td>'+new Date(j.updated_at).toLocaleString()+'</td></tr>').join('')+'</tbody></table>';
       jobsEl.querySelectorAll('a[data-job-id]').forEach(l=>l.addEventListener('click',e=>{e.preventDefault();selectedJobId=l.dataset.jobId;loadDetails(selectedJobId)}));if(selectedJobId)loadDetails(selectedJobId)}
-    async function loadDetails(id){const d=await api('/api/jobs/'+id+'/sample');detailsEl.innerHTML='<h2>Detalle</h2><p><code>'+d.job.hash+'</code></p><p class="hint">Lote: '+((d.job.batch_name||d.job.batch_dir)||'-')+'</p>'+(d.job.error?'<p class="hint">Error: '+d.job.error+'</p>':'')+'<p class="hint">Carpeta en contenedor: <code>'+d.job.sample_dir+'</code></p><div class="images">'+d.images.map(src=>'<a href="'+src+'" target="_blank"><img src="'+src+'" alt=""></a>').join('')+'</div>'}
+    function fmtTimestamp(ts){const n=Number(ts);if(!Number.isFinite(n)||n<=0)return '-';return new Date(n*1000).toLocaleString()+' UTC'}
+    function fmtCreateDate(v){if(!v)return '';const m=String(v).match(/^(\\d{4}):(\\d{2}):(\\d{2}) (\\d{2}:\\d{2}:\\d{2})/);return m?m[1]+'-'+m[2]+'-'+m[3]+' '+m[4]:String(v)}
+    function analysisDate(s){return s.create_date?fmtCreateDate(s.create_date):fmtTimestamp(s.timestamp)}
+    function renderAnalysis(a){if(!a)return '<div class="analysis"><h2>Analisis estatico</h2><p class="hint">Sin analisis estatico guardado para este trabajo.</p></div>';if(a.error)return '<div class="analysis"><h2>Analisis estatico</h2><p class="hint">No se pudo leer: '+esc(a.error)+'</p></div>';const s=a.summary||{};const yara=(s.yara_matches||[]).join(', ')||'sin coincidencias';const pdf=(s.is_pdf?'si, '+(s.pdf_risk_flags||[]).length+' alertas':'no');return '<div class="analysis"><h2>Analisis estatico</h2><div class="analysis-grid"><div><span>Tamano</span><strong>'+esc(s.size_bytes??'-')+' bytes</strong></div><div><span>Entropia</span><strong>'+esc(s.entropy??'-')+'</strong></div><div><span>Fecha</span><strong>'+esc(analysisDate(s))+'</strong></div><div><span>Fuente fecha</span><strong>'+esc(s.date_source||'-')+'</strong></div><div><span>Tipo</span><strong>'+esc(s.file_type||'-')+'</strong></div><div><span>MIME</span><strong>'+esc(s.mime_type||'-')+'</strong></div><div><span>Strings</span><strong>'+esc(s.strings_total??0)+' detectadas</strong></div><div><span>IOCs</span><strong>'+esc(s.ioc_total??0)+' detectados</strong></div><div><span>PDF</span><strong>'+esc(pdf)+'</strong></div><div><span>YARA</span><strong>'+esc(s.yara_match_count??0)+' reglas</strong></div><div><span>PE</span><strong>'+(s.is_pe?esc(s.pe_sections)+' secciones, '+esc(s.pe_import_dlls)+' DLLs':'no')+'</strong></div><div><span>ELF</span><strong>'+(s.is_elf?'si':'no')+'</strong></div><div><span>ExifTool</span><strong>'+(s.exiftool_available?'disponible':'no disponible')+'</strong></div></div><p class="hint">YARA: '+esc(yara)+'</p><p class="hint">JSON completo: <a href="'+esc(a.artifact)+'" target="_blank">analysis/static_analysis.json</a></p><p><code>'+esc(s.sha256||'')+'</code></p></div>'}
+    async function loadDetails(id){const d=await api('/api/jobs/'+id+'/sample');detailsEl.innerHTML='<h2>Detalle</h2><p><code>'+esc(d.job.hash)+'</code></p><p class="hint">Lote: '+esc((d.job.batch_name||d.job.batch_dir)||'-')+'</p>'+(d.job.error?'<p class="hint">Error: '+esc(d.job.error)+'</p>':'')+'<p class="hint">Carpeta en contenedor: <code>'+esc(d.job.sample_dir)+'</code></p>'+renderAnalysis(d.analysis)+'<div class="images">'+d.images.map(src=>'<a href="'+esc(src)+'" target="_blank"><img src="'+esc(src)+'" alt=""></a>').join('')+'</div>'}
     submit.addEventListener('click',async()=>{submit.disabled=true;hint.textContent='Encolando...';try{const result=await api('/api/jobs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({hashes:document.querySelector('#hashes').value,batch_name:batchName.value,append_batch:existingBatch.value})});hint.textContent=result.created.length+' trabajo(s) creados en '+result.batch+'.';document.querySelector('#hashes').value='';batchName.value='';await refreshBatches();await refresh()}catch(e){hint.textContent=e.message}finally{submit.disabled=false}});
     refreshConfig();refreshBatches();refresh();setInterval(refresh,2500);
   </script>
@@ -573,7 +639,7 @@ class Handler(BaseHTTPRequestHandler):
             job = next((item for item in read_jobs() if item["id"] == job_id), None)
             if not job:
                 return self.send_json({"error": "No encontrado"}, 404)
-            return self.send_json({"job": job, "images": collect_images(job)})
+            return self.send_json({"job": job, "images": collect_images(job), "analysis": collect_analysis(job)})
         if self.path.startswith("/artifacts/"):
             return self.send_artifact()
         self.send_response(404)
@@ -655,7 +721,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        content_type = "image/png" if target.suffix.lower() == ".png" else "text/plain; charset=utf-8"
+        if target.suffix.lower() == ".png":
+            content_type = "image/png"
+        elif target.suffix.lower() == ".json":
+            content_type = "application/json; charset=utf-8"
+        else:
+            content_type = "text/plain; charset=utf-8"
         data = target.read_bytes()
         self.send_response(200)
         self.send_header("content-type", content_type)

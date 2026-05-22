@@ -21,6 +21,7 @@ MAX_STORED_STRINGS = 250
 MAX_STRING_LENGTH = 300
 MAX_TOOL_OUTPUT = 12000
 MAX_IOCS_PER_TYPE = 200
+MAX_IMAGE_TOP_BINS = 16
 
 
 def log(message: str) -> None:
@@ -135,6 +136,16 @@ def byte_profile(path: Path) -> dict:
         "byte_histogram": histogram,
         "top_bytes": top_bytes,
     }
+
+
+def entropy_from_histogram(histogram: list[int], total: int) -> float:
+    entropy = 0.0
+    if total:
+        for count in histogram:
+            if count:
+                probability = count / total
+                entropy -= probability * math.log2(probability)
+    return round(entropy, 6)
 
 
 def extract_ascii_strings(path: Path, min_length: int = 4) -> dict:
@@ -492,6 +503,163 @@ def generate_images(binary: Path, image_dir: Path) -> int:
     return count
 
 
+def image_channel_summary(histogram: list[int], total: int) -> dict:
+    top_bins = sorted(
+        (
+            {"value": index, "count": count, "ratio": count / total if total else 0}
+            for index, count in enumerate(histogram)
+        ),
+        key=lambda item: item["count"],
+        reverse=True,
+    )[:MAX_IMAGE_TOP_BINS]
+    return {
+        "histogram": histogram,
+        "entropy": entropy_from_histogram(histogram, total),
+        "top_bins": top_bins,
+    }
+
+
+def analyze_image_file(path: Path, image_root: Path) -> dict:
+    try:
+        from PIL import Image, ImageFilter, ImageStat
+    except Exception as exc:
+        return {
+            "relative_path": path.relative_to(image_root).as_posix(),
+            "error": f"Pillow no esta disponible: {exc}",
+        }
+
+    relative_path = path.relative_to(image_root).as_posix()
+    algorithm = Path(relative_path).parts[0] if len(Path(relative_path).parts) > 1 else ""
+    result = {
+        "relative_path": relative_path,
+        "algorithm": algorithm,
+        "file_name": path.name,
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "exiftool": exiftool_metadata(path),
+    }
+
+    try:
+        with Image.open(path) as image:
+            image.load()
+            width, height = image.size
+            bands = image.getbands()
+            alpha = "A" in bands
+            color_image = image.convert("RGBA" if alpha else "RGB")
+            gray_image = image.convert("L")
+            pixels = width * height
+            gray_histogram = gray_image.histogram()
+            color_histogram = color_image.histogram()
+            color_bands = color_image.getbands()
+            stat = ImageStat.Stat(gray_image)
+            color_stat = ImageStat.Stat(color_image)
+            gray_extrema = gray_image.getextrema()
+            color_extrema = color_image.getextrema()
+            edges = gray_image.filter(ImageFilter.FIND_EDGES)
+            edge_mean = ImageStat.Stat(edges).mean[0] if pixels else 0
+
+            channel_histograms = {}
+            for index, band in enumerate(color_bands):
+                start = index * 256
+                channel_histograms[band] = image_channel_summary(
+                    color_histogram[start:start + 256],
+                    pixels,
+                )
+
+            result.update({
+                "format": image.format,
+                "mode": image.mode,
+                "bands": list(bands),
+                "width": width,
+                "height": height,
+                "pixels": pixels,
+                "aspect_ratio": round(width / height, 6) if height else None,
+                "has_alpha": alpha,
+                "grayscale": {
+                    "mean": round(stat.mean[0], 6),
+                    "stddev": round(stat.stddev[0], 6),
+                    "min": gray_extrema[0] if gray_extrema else None,
+                    "max": gray_extrema[1] if gray_extrema else None,
+                    "histogram": gray_histogram,
+                    "entropy": entropy_from_histogram(gray_histogram, pixels),
+                    "top_bins": image_channel_summary(gray_histogram, pixels)["top_bins"],
+                },
+                "channels": {
+                    band: {
+                        **channel_histograms[band],
+                        "mean": round(color_stat.mean[index], 6),
+                        "stddev": round(color_stat.stddev[index], 6),
+                        "min": color_extrema[index][0],
+                        "max": color_extrema[index][1],
+                    }
+                    for index, band in enumerate(color_bands)
+                },
+                "edge_density": round(edge_mean / 255, 6),
+            })
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def average(values: list[float]) -> float | None:
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 6)
+
+
+def summarize_image_analysis(images: list[dict]) -> dict:
+    valid = [image for image in images if not image.get("error")]
+    algorithms = sorted({image.get("algorithm") for image in valid if image.get("algorithm")})
+    widths = [image.get("width") for image in valid if image.get("width")]
+    heights = [image.get("height") for image in valid if image.get("height")]
+    modes = sorted({image.get("mode") for image in valid if image.get("mode")})
+    per_algorithm = {}
+    for algorithm in algorithms:
+        selected = [image for image in valid if image.get("algorithm") == algorithm]
+        per_algorithm[algorithm] = {
+            "count": len(selected),
+            "avg_entropy": average([(image.get("grayscale") or {}).get("entropy") for image in selected]),
+            "avg_brightness": average([(image.get("grayscale") or {}).get("mean") for image in selected]),
+            "avg_contrast": average([(image.get("grayscale") or {}).get("stddev") for image in selected]),
+            "avg_edge_density": average([image.get("edge_density") for image in selected]),
+        }
+    return {
+        "total_images": len(images),
+        "valid_images": len(valid),
+        "failed_images": len(images) - len(valid),
+        "algorithms": algorithms,
+        "modes": modes,
+        "width_min": min(widths) if widths else None,
+        "width_max": max(widths) if widths else None,
+        "height_min": min(heights) if heights else None,
+        "height_max": max(heights) if heights else None,
+        "avg_entropy": average([(image.get("grayscale") or {}).get("entropy") for image in valid]),
+        "avg_brightness": average([(image.get("grayscale") or {}).get("mean") for image in valid]),
+        "avg_contrast": average([(image.get("grayscale") or {}).get("stddev") for image in valid]),
+        "avg_edge_density": average([image.get("edge_density") for image in valid]),
+        "exiftool_available": any((image.get("exiftool") or {}).get("available") for image in images),
+        "per_algorithm": per_algorithm,
+    }
+
+
+def image_analysis(image_dir: Path, analysis_dir: Path) -> dict:
+    log("Ejecutando analisis de imagenes generadas.")
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    image_paths = sorted(image_dir.rglob("*.png")) if image_dir.exists() else []
+    images = [analyze_image_file(path, image_dir) for path in image_paths]
+    analysis = {
+        "schema_version": 1,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": "Imagenes PNG generadas por lib_bin2png.",
+        "summary": summarize_image_analysis(images),
+        "images": images,
+    }
+    output = analysis_dir / "image_analysis.json"
+    output.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
+    return analysis
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("Uso: process_sample.py <hash>", file=sys.stderr)
@@ -509,7 +677,7 @@ def main() -> int:
         "hash": sample_hash,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "status": "running",
-        "stored_artifacts": ["images", "analysis/static_analysis.json", "metadata.json"],
+        "stored_artifacts": ["images", "analysis/static_analysis.json", "analysis/image_analysis.json", "metadata.json"],
     }
 
     tmp_root = Path(tempfile.mkdtemp(prefix=f"sample-{sample_hash}-"))
@@ -531,6 +699,11 @@ def main() -> int:
             "sha256": analysis["hashes"]["sha256"],
         }
         metadata["image_count"] = generate_images(binary, image_dir)
+        image_report = image_analysis(image_dir, analysis_dir)
+        metadata["image_analysis"] = {
+            "path": "analysis/image_analysis.json",
+            **image_report["summary"],
+        }
         metadata["status"] = "completed"
         return 0
     except Exception as exc:

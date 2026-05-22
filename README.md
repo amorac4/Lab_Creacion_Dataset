@@ -83,6 +83,7 @@ data/
         wem/*.png
       analysis/
         static_analysis.json
+        image_analysis.json
       metadata.json
 ```
 
@@ -111,6 +112,31 @@ El reporte incluye:
 - Cabecera de objeto con `objdump`.
 
 La UI muestra un resumen del analisis en el detalle de cada trabajo, incluyendo fecha legible, IOCs, PDF, YARA, PE, ELF y enlace al JSON completo.
+
+## Analisis de imagenes
+
+Despues de generar los PNG, el worker crea:
+
+```text
+data/<nombre_lote>/<hash>/analysis/image_analysis.json
+```
+
+El reporte de imagenes incluye:
+
+- Metadata de cada PNG con `exiftool`.
+- Dimensiones, modo de color, bandas, aspecto, pixeles y tamano.
+- SHA256 del PNG generado.
+- Histograma en escala de grises y por canal.
+- Entropia, brillo medio, contraste, minimos, maximos y bins dominantes.
+- Densidad de bordes como aproximacion de complejidad visual.
+- Resumen agregado por lote/hash y por algoritmo (`markov`, `simhash`, `bigram_dct`, `bin2rgb`, `wem`).
+
+La UI muestra:
+
+- Un resumen agregado: cantidad de imagenes, algoritmos, dimensiones, modos, entropia media, brillo, contraste y densidad de bordes.
+- Una tarjeta por PNG con la imagen y sus metricas principales debajo.
+- Un panel de imagen seleccionada con dimensiones, modo, pixeles, tamano, entropia, brillo, contraste, rango, bins dominantes, canales, ExifTool y SHA256 del PNG.
+- Un enlace al JSON completo.
 
 ## Reglas YARA
 

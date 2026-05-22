@@ -219,15 +219,22 @@ def job_sample_dir(job: dict) -> Path:
     return DATA_DIR / batch_dir / job["hash"]
 
 
-def collect_images(job: dict) -> list[str]:
+def collect_images(job: dict) -> list[dict]:
     sample_dir = job_sample_dir(job)
     base = sample_dir / "images"
     if not base.exists():
         return []
-    return [
-        f"/artifacts/{path.relative_to(DATA_DIR).as_posix()}"
-        for path in base.rglob("*.png")
-    ]
+    images = []
+    for path in sorted(base.rglob("*.png")):
+        relative_path = path.relative_to(base).as_posix()
+        parts = Path(relative_path).parts
+        images.append({
+            "url": f"/artifacts/{path.relative_to(DATA_DIR).as_posix()}",
+            "relative_path": relative_path,
+            "algorithm": parts[0] if len(parts) > 1 else "",
+            "file_name": path.name,
+        })
+    return images
 
 
 def collect_analysis(job: dict) -> dict | None:
@@ -283,6 +290,91 @@ def collect_analysis(job: dict) -> dict | None:
             "yara_match_count": yara.get("match_count", 0),
             "yara_matches": [match.get("rule") for match in (yara.get("matches") or [])],
         },
+    }
+
+
+def collect_image_analysis(job: dict) -> dict | None:
+    sample_dir = job_sample_dir(job)
+    path = sample_dir / "analysis" / "image_analysis.json"
+    if not path.exists():
+        return None
+    artifact = f"/artifacts/{path.relative_to(DATA_DIR).as_posix()}"
+    try:
+        analysis = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"artifact": artifact, "error": str(exc)}
+    summary = analysis.get("summary") or {}
+    per_algorithm = summary.get("per_algorithm") or {}
+    images = []
+    for image in analysis.get("images") or []:
+        grayscale = image.get("grayscale") or {}
+        channels = image.get("channels") or {}
+        exiftool = image.get("exiftool") or {}
+        exiftool_parsed = exiftool.get("parsed") or {}
+        images.append({
+            "relative_path": image.get("relative_path"),
+            "algorithm": image.get("algorithm"),
+            "file_name": image.get("file_name"),
+            "size_bytes": image.get("size_bytes"),
+            "sha256": image.get("sha256"),
+            "format": image.get("format"),
+            "mode": image.get("mode"),
+            "bands": image.get("bands") or [],
+            "width": image.get("width"),
+            "height": image.get("height"),
+            "pixels": image.get("pixels"),
+            "aspect_ratio": image.get("aspect_ratio"),
+            "has_alpha": image.get("has_alpha"),
+            "edge_density": image.get("edge_density"),
+            "grayscale": {
+                "mean": grayscale.get("mean"),
+                "stddev": grayscale.get("stddev"),
+                "entropy": grayscale.get("entropy"),
+                "min": grayscale.get("min"),
+                "max": grayscale.get("max"),
+                "histogram": grayscale.get("histogram") or [],
+                "top_bins": grayscale.get("top_bins") or [],
+            },
+            "channels": {
+                name: {
+                    "mean": value.get("mean"),
+                    "stddev": value.get("stddev"),
+                    "entropy": value.get("entropy"),
+                    "min": value.get("min"),
+                    "max": value.get("max"),
+                    "histogram": value.get("histogram") or [],
+                    "top_bins": value.get("top_bins") or [],
+                }
+                for name, value in channels.items()
+            },
+            "exiftool_available": exiftool.get("available"),
+            "exiftool": {
+                key: exiftool_parsed.get(key)
+                for key in ("FileType", "MIMEType", "ImageWidth", "ImageHeight", "BitDepth", "ColorType", "Compression", "Filter", "Interlace")
+                if key in exiftool_parsed
+            },
+            "error": image.get("error"),
+        })
+    return {
+        "artifact": artifact,
+        "summary": {
+            "total_images": summary.get("total_images"),
+            "valid_images": summary.get("valid_images"),
+            "failed_images": summary.get("failed_images"),
+            "algorithms": summary.get("algorithms") or [],
+            "modes": summary.get("modes") or [],
+            "width_min": summary.get("width_min"),
+            "width_max": summary.get("width_max"),
+            "height_min": summary.get("height_min"),
+            "height_max": summary.get("height_max"),
+            "avg_entropy": summary.get("avg_entropy"),
+            "avg_brightness": summary.get("avg_brightness"),
+            "avg_contrast": summary.get("avg_contrast"),
+            "avg_edge_density": summary.get("avg_edge_density"),
+            "exiftool_available": summary.get("exiftool_available"),
+            "per_algorithm": per_algorithm,
+        },
+        "images": images,
     }
 
 
@@ -544,8 +636,17 @@ def page() -> str:
     .secondary{background:#4b5563}.danger{background:#b42318}
     .check{display:flex;align-items:center;gap:8px;margin:8px 0;color:#344054}
     input[type=checkbox]{width:auto;height:auto;margin:0}
-    .details{margin-top:18px}.images{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:10px;margin-top:10px}
-    .images img{width:100%;aspect-ratio:1/1;object-fit:contain;border:1px solid #d8dde5;border-radius:6px;background:#fafafa}
+    .details{margin-top:18px}.images{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-top:10px}
+    .image-card{border:1px solid #d8dde5;border-radius:6px;background:#fafafa;padding:8px;display:flex;flex-direction:column;gap:7px;min-width:0}
+    .image-card.selected{border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.15)}
+    .image-card img{width:100%;aspect-ratio:1/1;object-fit:contain;border:1px solid #d8dde5;border-radius:6px;background:#fff}
+    .image-card button{height:30px;background:#2563eb;font-size:12px}
+    .image-metrics{font-size:12px;color:#344054;line-height:1.35}.image-metrics div{overflow-wrap:anywhere}
+    .selected-image{display:grid;grid-template-columns:minmax(180px,260px) 1fr;gap:12px;align-items:start}
+    .selected-image img{width:100%;max-height:260px;object-fit:contain;border:1px solid #d8dde5;border-radius:6px;background:#fff}
+    .histogram{margin-top:10px;border:1px solid #d8dde5;border-radius:6px;background:#fff;padding:8px}
+    .histogram h3{margin:0 0 6px;font-size:13px}
+    .histogram svg{width:100%;height:96px;display:block;background:#fafafa;border-radius:4px}
     .analysis{margin-top:16px;border-top:1px solid #d8dde5;padding-top:14px}
     .analysis-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin:10px 0}
     .analysis-grid div{border:1px solid #d8dde5;border-radius:6px;background:#fafafa;padding:8px;min-width:0}
@@ -555,7 +656,7 @@ def page() -> str:
     .metric{border:1px solid #d8dde5;border-radius:6px;padding:10px;background:#fafafa}
     .metric span{display:block;color:#667085;font-size:12px;text-transform:uppercase}
     .metric strong{display:block;margin-top:4px;font-size:14px}
-    a{color:#2563eb;text-decoration:none}@media(max-width:860px){main{grid-template-columns:1fr;padding:14px}header{padding-inline:18px}}
+    a{color:#2563eb;text-decoration:none}@media(max-width:860px){main{grid-template-columns:1fr;padding:14px}header{padding-inline:18px}.selected-image{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -592,7 +693,7 @@ def page() -> str:
     </section>
   </main>
   <script>
-    const jobsEl=document.querySelector('#jobs'),detailsEl=document.querySelector('#details'),summaryEl=document.querySelector('#batchSummary'),submit=document.querySelector('#submit'),hint=document.querySelector('#submitHint'),jobsHint=document.querySelector('#jobsHint'),optionsHint=document.querySelector('#optionsHint'),existingBatch=document.querySelector('#existingBatch'),batchName=document.querySelector('#batchName');let selectedJobId=null;
+    const jobsEl=document.querySelector('#jobs'),detailsEl=document.querySelector('#details'),summaryEl=document.querySelector('#batchSummary'),submit=document.querySelector('#submit'),hint=document.querySelector('#submitHint'),jobsHint=document.querySelector('#jobsHint'),optionsHint=document.querySelector('#optionsHint'),existingBatch=document.querySelector('#existingBatch'),batchName=document.querySelector('#batchName');let selectedJobId=null;let selectedImageByJob={};
     async function api(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error(await r.text());return r.json()}
     function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
     function pill(s){return '<span class="pill '+s+'">'+s+'</span>'}
@@ -604,7 +705,7 @@ def page() -> str:
     document.querySelector('#stopJobs').addEventListener('click',async()=>{jobsHint.textContent='Deteniendo...';try{await api('/api/control/stop',{method:'POST'});jobsHint.textContent='Procesamiento detenido.';await refresh()}catch(e){jobsHint.textContent=e.message}});
     document.querySelector('#shutdownLab').addEventListener('click',async()=>{if(!confirm('Esto terminara el servidor del laboratorio. Puedes volver a iniciarlo con start_lab_docker.cmd.'))return;jobsHint.textContent='Terminando laboratorio...';try{await api('/api/control/shutdown',{method:'POST'});jobsHint.textContent='Laboratorio detenido.'}catch(e){jobsHint.textContent=e.message}});
     existingBatch.addEventListener('change',()=>{batchName.disabled=!!existingBatch.value;if(existingBatch.value)batchName.value=''});
-    document.querySelector('#clearJobs').addEventListener('click',async()=>{if(!confirm('Esto limpiara solo la lista de trabajos. No borra imagenes ni carpetas de lotes.'))return;jobsHint.textContent='Limpiando...';try{await api('/api/jobs/clear',{method:'POST'});selectedJobId=null;jobsHint.textContent='Lista limpia.';await refresh()}catch(e){jobsHint.textContent=e.message}});
+    document.querySelector('#clearJobs').addEventListener('click',async()=>{if(!confirm('Esto limpiara solo la lista de trabajos. No borra imagenes ni carpetas de lotes.'))return;jobsHint.textContent='Limpiando...';try{await api('/api/jobs/clear',{method:'POST'});selectedJobId=null;selectedImageByJob={};jobsHint.textContent='Lista limpia.';await refresh()}catch(e){jobsHint.textContent=e.message}});
     function fmtSeconds(s){s=Math.max(0,Math.floor(s||0));const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return (h?h+'h ':'')+(m||h?m+'m ':'')+sec+'s'}
     function fmtEpoch(e){return e?new Date(e*1000).toLocaleString():'-'}
     function renderSummary(s){if(!s){summaryEl.innerHTML='';return}summaryEl.innerHTML='<div class="summary"><div class="metric"><span>Inicio</span><strong>'+fmtEpoch(s.started_at)+'</strong></div><div class="metric"><span>Restante</span><strong>'+fmtSeconds(s.remaining_seconds)+'</strong></div><div class="metric"><span>Final estimado</span><strong>'+fmtEpoch(s.estimated_finish_at)+'</strong></div><div class="metric"><span>Progreso</span><strong>'+s.completed+'/'+s.total+' ok, '+s.skipped+' saltados, '+s.failed+' fallidos</strong></div></div>'}
@@ -615,7 +716,17 @@ def page() -> str:
     function fmtCreateDate(v){if(!v)return '';const m=String(v).match(/^(\\d{4}):(\\d{2}):(\\d{2}) (\\d{2}:\\d{2}:\\d{2})/);return m?m[1]+'-'+m[2]+'-'+m[3]+' '+m[4]:String(v)}
     function analysisDate(s){return s.create_date?fmtCreateDate(s.create_date):fmtTimestamp(s.timestamp)}
     function renderAnalysis(a){if(!a)return '<div class="analysis"><h2>Analisis estatico</h2><p class="hint">Sin analisis estatico guardado para este trabajo.</p></div>';if(a.error)return '<div class="analysis"><h2>Analisis estatico</h2><p class="hint">No se pudo leer: '+esc(a.error)+'</p></div>';const s=a.summary||{};const yara=(s.yara_matches||[]).join(', ')||'sin coincidencias';const pdf=(s.is_pdf?'si, '+(s.pdf_risk_flags||[]).length+' alertas':'no');return '<div class="analysis"><h2>Analisis estatico</h2><div class="analysis-grid"><div><span>Tamano</span><strong>'+esc(s.size_bytes??'-')+' bytes</strong></div><div><span>Entropia</span><strong>'+esc(s.entropy??'-')+'</strong></div><div><span>Fecha</span><strong>'+esc(analysisDate(s))+'</strong></div><div><span>Fuente fecha</span><strong>'+esc(s.date_source||'-')+'</strong></div><div><span>Tipo</span><strong>'+esc(s.file_type||'-')+'</strong></div><div><span>MIME</span><strong>'+esc(s.mime_type||'-')+'</strong></div><div><span>Strings</span><strong>'+esc(s.strings_total??0)+' detectadas</strong></div><div><span>IOCs</span><strong>'+esc(s.ioc_total??0)+' detectados</strong></div><div><span>PDF</span><strong>'+esc(pdf)+'</strong></div><div><span>YARA</span><strong>'+esc(s.yara_match_count??0)+' reglas</strong></div><div><span>PE</span><strong>'+(s.is_pe?esc(s.pe_sections)+' secciones, '+esc(s.pe_import_dlls)+' DLLs':'no')+'</strong></div><div><span>ELF</span><strong>'+(s.is_elf?'si':'no')+'</strong></div><div><span>ExifTool</span><strong>'+(s.exiftool_available?'disponible':'no disponible')+'</strong></div></div><p class="hint">YARA: '+esc(yara)+'</p><p class="hint">JSON completo: <a href="'+esc(a.artifact)+'" target="_blank">analysis/static_analysis.json</a></p><p><code>'+esc(s.sha256||'')+'</code></p></div>'}
-    async function loadDetails(id){const d=await api('/api/jobs/'+id+'/sample');detailsEl.innerHTML='<h2>Detalle</h2><p><code>'+esc(d.job.hash)+'</code></p><p class="hint">Lote: '+esc((d.job.batch_name||d.job.batch_dir)||'-')+'</p>'+(d.job.error?'<p class="hint">Error: '+esc(d.job.error)+'</p>':'')+'<p class="hint">Carpeta en contenedor: <code>'+esc(d.job.sample_dir)+'</code></p>'+renderAnalysis(d.analysis)+'<div class="images">'+d.images.map(src=>'<a href="'+esc(src)+'" target="_blank"><img src="'+esc(src)+'" alt=""></a>').join('')+'</div>'}
+    function imageAnalysisMap(a){const map={};(a&&a.images||[]).forEach(img=>{if(img.relative_path)map[img.relative_path]=img});return map}
+    function fmtNum(v){return v===null||v===undefined?'-':Number(v).toFixed?Number(v).toFixed(3).replace(/\\.000$/,''):esc(v)}
+    function renderTopBins(bins){bins=(bins||[]).slice(0,6);return bins.length?bins.map(b=>b.value+': '+b.count).join(', '):'-'}
+    function renderHistogram(hist,color){hist=hist||[];if(!hist.length)return '<p class="hint">Histograma no disponible.</p>';const max=Math.max(...hist,1);const bars=hist.map((v,i)=>{const h=Math.max(0.5,(v/max)*88);return '<rect x="'+i+'" y="'+(92-h).toFixed(2)+'" width="1" height="'+h.toFixed(2)+'" fill="'+color+'"></rect>'}).join('');return '<svg viewBox="0 0 256 96" preserveAspectRatio="none" role="img" aria-label="Histograma">'+bars+'<line x1="0" y1="92" x2="256" y2="92" stroke="#98a2b3" stroke-width="1"></line></svg>'}
+    function renderImageMetrics(img){if(!img)return '<div class="image-metrics"><div>Analisis no disponible</div></div>';const g=img.grayscale||{};return '<div class="image-metrics"><div><strong>'+esc(img.algorithm||'-')+'</strong></div><div>'+esc(img.width||'-')+'x'+esc(img.height||'-')+' · '+esc(img.mode||'-')+'</div><div>Entropia: '+esc(g.entropy??'-')+'</div><div>Brillo: '+esc(g.mean??'-')+' · Contraste: '+esc(g.stddev??'-')+'</div><div>Bordes: '+esc(img.edge_density??'-')+'</div></div>'}
+    function renderImageCards(images,a){const map=imageAnalysisMap(a);if(!images.length)return '<p class="hint">Sin imagenes generadas.</p>';return '<div class="images">'+images.map((item,index)=>{const img=map[item.relative_path];return '<div class="image-card" data-image-index="'+index+'"><a href="'+esc(item.url)+'" target="_blank"><img src="'+esc(item.url)+'" alt=""></a>'+renderImageMetrics(img)+'<button type="button" data-select-image="'+index+'">Ver analisis</button></div>'}).join('')+'</div>'}
+    function renderSelectedImage(images,a,index){const map=imageAnalysisMap(a);if(!images.length)return '';const item=images[Math.max(0,Math.min(index||0,images.length-1))];const img=map[item.relative_path]||{};const g=img.grayscale||{};const channels=Object.entries(img.channels||{}).map(([name,c])=>'<div><span>Canal '+esc(name)+'</span><strong>H '+esc(c.entropy??'-')+' · Media '+esc(c.mean??'-')+' · SD '+esc(c.stddev??'-')+'</strong></div>').join('');const channelHist=Object.entries(img.channels||{}).filter(([name])=>name!=='A').slice(0,3).map(([name,c])=>'<div class="histogram"><h3>Canal '+esc(name)+'</h3>'+renderHistogram(c.histogram,name==='R'?'#dc2626':name==='G'?'#16a34a':'#2563eb')+'</div>').join('');const exif=Object.entries(img.exiftool||{}).map(([k,v])=>k+': '+v).join(' | ')||'-';return '<div class="analysis" id="selectedImageAnalysis"><h2>Imagen seleccionada</h2><div class="selected-image"><img src="'+esc(item.url)+'" alt=""><div><p><code>'+esc(item.relative_path)+'</code></p><div class="analysis-grid"><div><span>Algoritmo</span><strong>'+esc(img.algorithm||item.algorithm||'-')+'</strong></div><div><span>Dimensiones</span><strong>'+esc(img.width||'-')+'x'+esc(img.height||'-')+'</strong></div><div><span>Modo</span><strong>'+esc(img.mode||'-')+'</strong></div><div><span>Pixeles</span><strong>'+esc(img.pixels??'-')+'</strong></div><div><span>Tamano PNG</span><strong>'+esc(img.size_bytes??'-')+' bytes</strong></div><div><span>Entropia gris</span><strong>'+esc(g.entropy??'-')+'</strong></div><div><span>Brillo</span><strong>'+esc(g.mean??'-')+'</strong></div><div><span>Contraste</span><strong>'+esc(g.stddev??'-')+'</strong></div><div><span>Rango gris</span><strong>'+esc(g.min??'-')+' - '+esc(g.max??'-')+'</strong></div><div><span>Densidad bordes</span><strong>'+esc(img.edge_density??'-')+'</strong></div><div><span>Bins dominantes</span><strong>'+esc(renderTopBins(g.top_bins))+'</strong></div><div><span>ExifTool</span><strong>'+esc(exif)+'</strong></div>'+channels+'</div><div class="histogram"><h3>Histograma gris</h3>'+renderHistogram(g.histogram,'#475467')+'</div>'+channelHist+'<p class="hint">SHA256 PNG: <code>'+esc(img.sha256||'-')+'</code></p></div></div></div>'}
+    function renderImageAnalysis(a){if(!a)return '<div class="analysis"><h2>Analisis de imagenes</h2><p class="hint">Sin analisis de imagenes para este trabajo.</p></div>';if(a.error)return '<div class="analysis"><h2>Analisis de imagenes</h2><p class="hint">No se pudo leer: '+esc(a.error)+'</p></div>';const s=a.summary||{};const dims=(s.width_min&&s.height_min)?esc(s.width_min)+'x'+esc(s.height_min)+(s.width_max!==s.width_min||s.height_max!==s.height_min?' a '+esc(s.width_max)+'x'+esc(s.height_max):''):'-';const alg=(s.algorithms||[]).join(', ')||'-';const modes=(s.modes||[]).join(', ')||'-';return '<div class="analysis"><h2>Resumen de imagenes</h2><div class="analysis-grid"><div><span>Imagenes</span><strong>'+esc(s.valid_images??0)+' / '+esc(s.total_images??0)+'</strong></div><div><span>Algoritmos</span><strong>'+esc(alg)+'</strong></div><div><span>Dimensiones</span><strong>'+dims+'</strong></div><div><span>Modos</span><strong>'+esc(modes)+'</strong></div><div><span>Entropia media</span><strong>'+esc(s.avg_entropy??'-')+'</strong></div><div><span>Brillo medio</span><strong>'+esc(s.avg_brightness??'-')+'</strong></div><div><span>Contraste medio</span><strong>'+esc(s.avg_contrast??'-')+'</strong></div><div><span>Densidad de bordes</span><strong>'+esc(s.avg_edge_density??'-')+'</strong></div></div><p class="hint">JSON completo: <a href="'+esc(a.artifact)+'" target="_blank">analysis/image_analysis.json</a></p></div>'}
+    function markSelectedImage(index){detailsEl.querySelectorAll('.image-card').forEach(c=>c.classList.remove('selected'));const card=detailsEl.querySelector('.image-card[data-image-index="'+index+'"]');if(card)card.classList.add('selected')}
+    function bindImageSelection(jobId,images,a){detailsEl.querySelectorAll('[data-select-image]').forEach(btn=>btn.addEventListener('click',()=>{const index=Number(btn.dataset.selectImage||0);selectedImageByJob[jobId]=index;markSelectedImage(index);const panel=detailsEl.querySelector('#selectedImageMount');if(panel)panel.innerHTML=renderSelectedImage(images,a,index);const selected=detailsEl.querySelector('#selectedImageAnalysis');if(selected)selected.scrollIntoView({behavior:'smooth',block:'start'})}))}
+    async function loadDetails(id){const d=await api('/api/jobs/'+id+'/sample');const images=d.images||[];let imageIndex=Number(selectedImageByJob[id]||0);if(imageIndex>=images.length)imageIndex=0;selectedImageByJob[id]=imageIndex;detailsEl.innerHTML='<h2>Detalle</h2><p><code>'+esc(d.job.hash)+'</code></p><p class="hint">Lote: '+esc((d.job.batch_name||d.job.batch_dir)||'-')+'</p>'+(d.job.error?'<p class="hint">Error: '+esc(d.job.error)+'</p>':'')+'<p class="hint">Carpeta en contenedor: <code>'+esc(d.job.sample_dir)+'</code></p>'+renderAnalysis(d.analysis)+renderImageAnalysis(d.image_analysis)+renderImageCards(images,d.image_analysis)+'<div id="selectedImageMount">'+renderSelectedImage(images,d.image_analysis,imageIndex)+'</div>';bindImageSelection(id,images,d.image_analysis);markSelectedImage(imageIndex)}
     submit.addEventListener('click',async()=>{submit.disabled=true;hint.textContent='Encolando...';try{const result=await api('/api/jobs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({hashes:document.querySelector('#hashes').value,batch_name:batchName.value,append_batch:existingBatch.value})});hint.textContent=result.created.length+' trabajo(s) creados en '+result.batch+'.';document.querySelector('#hashes').value='';batchName.value='';await refreshBatches();await refresh()}catch(e){hint.textContent=e.message}finally{submit.disabled=false}});
     refreshConfig();refreshBatches();refresh();setInterval(refresh,2500);
   </script>
@@ -639,7 +750,12 @@ class Handler(BaseHTTPRequestHandler):
             job = next((item for item in read_jobs() if item["id"] == job_id), None)
             if not job:
                 return self.send_json({"error": "No encontrado"}, 404)
-            return self.send_json({"job": job, "images": collect_images(job), "analysis": collect_analysis(job)})
+            return self.send_json({
+                "job": job,
+                "images": collect_images(job),
+                "analysis": collect_analysis(job),
+                "image_analysis": collect_image_analysis(job),
+            })
         if self.path.startswith("/artifacts/"):
             return self.send_artifact()
         self.send_response(404)

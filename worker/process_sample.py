@@ -660,13 +660,7 @@ def image_analysis(image_dir: Path, analysis_dir: Path) -> dict:
     return analysis
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("Uso: process_sample.py <hash>", file=sys.stderr)
-        return 2
-
-    sample_hash = sys.argv[1].lower().strip()
-    sample_dir = Path(os.environ.get("SAMPLE_OUTPUT_DIR", str(DATA_DIR / sample_hash)))
+def process_archive(sample_hash: str, archive_path: Path, sample_dir: Path) -> int:
     image_dir = sample_dir / "images"
     analysis_dir = sample_dir / "analysis"
 
@@ -681,12 +675,10 @@ def main() -> int:
     }
 
     tmp_root = Path(tempfile.mkdtemp(prefix=f"sample-{sample_hash}-"))
-    original_zip = tmp_root / "original.zip"
     work_dir = tmp_root / "work"
 
     try:
-        download_sample(sample_hash, original_zip)
-        extracted = extract_archive(original_zip, work_dir)
+        extracted = extract_archive(archive_path, work_dir)
         binary = find_matching_binary(extracted, sample_hash)
         metadata["binary_sha256"] = sha256_file(binary)
         analysis = static_analysis(binary, analysis_dir)
@@ -713,8 +705,38 @@ def main() -> int:
         return 1
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
+        try:
+            archive_path.unlink()
+        except FileNotFoundError:
+            pass
         metadata["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def download_and_process(sample_hash: str, sample_dir: Path) -> int:
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"download-{sample_hash}-"))
+    original_zip = tmp_root / "original.zip"
+    try:
+        download_sample(sample_hash, original_zip)
+        return process_archive(sample_hash, original_zip, sample_dir)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def main() -> int:
+    if len(sys.argv) == 2:
+        sample_hash = sys.argv[1].lower().strip()
+        sample_dir = Path(os.environ.get("SAMPLE_OUTPUT_DIR", str(DATA_DIR / sample_hash)))
+        return download_and_process(sample_hash, sample_dir)
+
+    if len(sys.argv) == 4 and sys.argv[1] == "--process-archive":
+        sample_hash = sys.argv[2].lower().strip()
+        archive_path = Path(sys.argv[3])
+        sample_dir = Path(os.environ.get("SAMPLE_OUTPUT_DIR", str(DATA_DIR / sample_hash)))
+        return process_archive(sample_hash, archive_path, sample_dir)
+
+    print("Uso: process_sample.py <hash> | process_sample.py --process-archive <hash> <zip>", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import calendar
+import tempfile
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
@@ -16,6 +19,7 @@ DATA_DIR = Path("/lab/data")
 JOBS_FILE = DATA_DIR / "jobs.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 USAGE_FILE = DATA_DIR / "virushare_usage.json"
+DOWNLOAD_ROOT = Path(tempfile.gettempdir()) / "lab-creacion-dataset-downloads"
 VIRUSHARE_INTERVAL_SECONDS = int(os.environ.get("VIRUSHARE_INTERVAL_SECONDS", "16"))
 HASH_RE = re.compile(r"^[a-f0-9]{32}$|^[a-f0-9]{40}$|^[a-f0-9]{64}$")
 HASH_NAME_RE = re.compile(r"^[a-f0-9]{32}$|^[a-f0-9]{40}$|^[a-f0-9]{64}$")
@@ -31,10 +35,13 @@ if not CONFIG_FILE.exists():
 if not USAGE_FILE.exists():
     USAGE_FILE.write_text('{"last_request_at": null}\n', encoding="utf-8")
 
-queue: list[str] = []
-running = False
+download_queue: list[str] = []
+process_queue: list[str] = []
+download_running = False
+processing_running = False
 stop_requested = False
 current_process = None
+current_download_job_id = None
 lock = threading.Lock()
 usage_lock = threading.Lock()
 
@@ -124,7 +131,7 @@ def processing_options() -> dict:
     if not selected_image_algorithms:
         selected_image_algorithms = list(ALGORITHMS)
     return {
-        "skip_processed_hash": bool(config.get("skip_processed_hash", False)),
+        "skip_processed_hash": True,
         "selected_image_algorithms": selected_image_algorithms,
     }
 
@@ -381,15 +388,18 @@ def collect_image_analysis(job: dict) -> dict | None:
 def has_sample_results(job: dict) -> bool:
     sample_dir = job_sample_dir(job)
     metadata_path = sample_dir / "metadata.json"
-    if count_pngs(sample_dir / "images") > 0:
-        return True
     if metadata_path.exists():
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            return metadata.get("status") == "completed"
+            if metadata.get("status") == "completed" and count_pngs(sample_dir / "images") > 0:
+                return True
         except Exception:
-            return False
-    return False
+            pass
+    return (
+        count_pngs(sample_dir / "images") > 0
+        and (sample_dir / "analysis" / "static_analysis.json").exists()
+        and (sample_dir / "analysis" / "image_analysis.json").exists()
+    )
 
 
 def batch_summary(jobs: list[dict]) -> dict | None:
@@ -443,6 +453,19 @@ def batch_summary(jobs: list[dict]) -> dict | None:
     }
 
 
+def sort_jobs_recent_first(jobs: list[dict]) -> list[dict]:
+    return sorted(
+        jobs,
+        key=lambda job: (
+            parse_iso(job.get("batch_created_at")) or parse_iso(job.get("created_at")) or 0,
+            parse_iso(job.get("created_at")) or 0,
+            parse_iso(job.get("updated_at")) or 0,
+            job.get("id") or "",
+        ),
+        reverse=True,
+    )
+
+
 def create_jobs(hashes: list[str], batch_name: str, append_batch: str = "") -> list[dict]:
     global stop_requested
     now = iso_now()
@@ -463,6 +486,9 @@ def create_jobs(hashes: list[str], batch_name: str, append_batch: str = "") -> l
             "created_at": now,
             "updated_at": now,
             "started_at": None,
+            "download_started_at": None,
+            "download_finished_at": None,
+            "process_started_at": None,
             "finished_at": None,
             "error": None,
             "image_count": 0,
@@ -470,35 +496,89 @@ def create_jobs(hashes: list[str], batch_name: str, append_batch: str = "") -> l
         }
         for index, sample_hash in enumerate(hashes)
     ]
+    for job in created:
+        if has_sample_results(job):
+            job["status"] = "skipped"
+            job["finished_at"] = now
+            job["image_count"] = count_pngs(job_sample_dir(job) / "images")
+            job["error"] = "Saltado antes de cuota: el hash ya tiene resultados completos en este lote."
     with lock:
         stop_requested = False
         jobs = read_jobs()
         write_jobs(created + jobs)
-        queue.extend(job["id"] for job in created)
-    run_queue()
+        download_queue.extend(job["id"] for job in created if job["status"] == "queued")
+    run_download_queue()
+    run_process_queue()
     return created
 
 
-def run_queue() -> None:
-    global running
+def job_download_path(job: dict) -> Path:
+    safe_job_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", job["id"])
+    return DOWNLOAD_ROOT / safe_job_id / "original.zip"
+
+
+def cleanup_download(job: dict) -> None:
+    download_path = job.get("download_path")
+    if not download_path:
+        return
+    path = Path(download_path)
+    shutil.rmtree(path.parent, ignore_errors=True)
+
+
+def download_sample_archive(sample_hash: str, destination: Path) -> None:
+    api_key = virushare_api_key()
+    template = os.environ.get("VIRUSHARE_URL_TEMPLATE", "").strip()
+    if not template:
+        template = "https://virusshare.com/apiv2/download?apikey={api_key}&hash={hash}"
+    if "{api_key}" in template and not api_key:
+        raise RuntimeError("Falta VIRUSHARE_API_KEY para descargar desde VirusShare.")
+    url = template.format(api_key=api_key, hash=sample_hash)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(url, headers={"User-Agent": "lab-creacion-dataset/0.1"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        status = getattr(response, "status", 200)
+        if status >= 400:
+            raise RuntimeError(f"VirusShare respondio con HTTP {status}.")
+        with destination.open("wb") as output:
+            shutil.copyfileobj(response, output)
+
+
+def run_download_queue() -> None:
+    global download_running, current_download_job_id
     with lock:
-        if running or not queue:
+        if download_running or not download_queue:
             return
-        job_id = queue.pop(0)
+        job_id = download_queue.pop(0)
         jobs = read_jobs()
         job = next((item for item in jobs if item["id"] == job_id), None)
         if not job:
             return
-        running = True
-    threading.Thread(target=process_job, args=(job,), daemon=True).start()
+        download_running = True
+        current_download_job_id = job_id
+    threading.Thread(target=download_job, args=(job,), daemon=True).start()
+
+
+def run_process_queue() -> None:
+    global processing_running
+    with lock:
+        if processing_running or not process_queue:
+            return
+        job_id = process_queue.pop(0)
+        jobs = read_jobs()
+        job = next((item for item in jobs if item["id"] == job_id), None)
+        if not job:
+            return
+        processing_running = True
+    threading.Thread(target=process_downloaded_job, args=(job,), daemon=True).start()
 
 
 def stop_processing() -> dict:
-    global current_process, running, stop_requested
+    global current_process, stop_requested
     stopped_process = False
     with lock:
         stop_requested = True
-        queue.clear()
+        download_queue.clear()
+        process_queue.clear()
         process = current_process
 
     if process and process.poll() is None:
@@ -508,14 +588,17 @@ def stop_processing() -> dict:
     with lock:
         jobs = read_jobs()
         now = iso_now()
+        active_download_id = current_download_job_id
         for job in jobs:
-            if job["status"] in ("queued", "waiting_rate_limit"):
+            if job["status"] in ("queued", "waiting_rate_limit", "downloading", "downloaded", "processing"):
                 job["status"] = "stopped"
                 job["updated_at"] = now
                 job["finished_at"] = now
                 job["error"] = "Detenido por usuario."
+                if job["id"] != active_download_id:
+                    cleanup_download(job)
         write_jobs(jobs)
-        if not running:
+        if not download_running and not processing_running:
             stop_requested = False
 
     return {"ok": True, "stopped_process": stopped_process}
@@ -524,9 +607,10 @@ def stop_processing() -> dict:
 def clear_job_list() -> bool:
     global stop_requested
     with lock:
-        if running:
+        if download_running or processing_running:
             return False
-        queue.clear()
+        download_queue.clear()
+        process_queue.clear()
         stop_requested = False
         write_jobs([])
         return True
@@ -538,29 +622,91 @@ def shutdown_laboratory() -> dict:
     return {"ok": True, **result}
 
 
-def process_job(job: dict) -> None:
-    global current_process, running, stop_requested
+def download_job(job: dict) -> None:
+    global download_running, current_download_job_id, stop_requested
     sample_hash = job["hash"]
-    sample_dir = job_sample_dir(job)
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    update_job(job["id"], {"status": "running", "started_at": iso_now(), "error": None})
-    options = processing_options()
-    if options["skip_processed_hash"] and has_sample_results(job):
+    download_path = job_download_path(job)
+    try:
+        if not reserve_virushare_slot(job["id"]):
+            update_job(
+                job["id"],
+                {
+                    "status": "stopped",
+                    "finished_at": iso_now(),
+                    "image_count": count_pngs(job_sample_dir(job) / "images"),
+                    "error": "Detenido por usuario.",
+                },
+            )
+            return
         update_job(
             job["id"],
             {
-                "status": "skipped",
-                "finished_at": iso_now(),
-                "image_count": count_pngs(sample_dir / "images"),
-                "error": "Saltado: el hash ya tiene resultados guardados.",
+                "status": "downloading",
+                "started_at": iso_now(),
+                "download_started_at": iso_now(),
+                "download_path": str(download_path),
+                "error": None,
+            },
+        )
+        download_sample_archive(sample_hash, download_path)
+        with lock:
+            stopped = stop_requested
+        if stopped:
+            cleanup_download({"download_path": str(download_path)})
+            update_job(
+                job["id"],
+                {
+                    "status": "stopped",
+                    "finished_at": iso_now(),
+                    "image_count": count_pngs(job_sample_dir(job) / "images"),
+                    "error": "Detenido por usuario.",
+                },
+            )
+            return
+        update_job(
+            job["id"],
+            {
+                "status": "downloaded",
+                "download_finished_at": iso_now(),
+                "download_path": str(download_path),
+                "error": None,
             },
         )
         with lock:
-            running = False
-        run_queue()
-        return
+            process_queue.append(job["id"])
+        run_process_queue()
+    except Exception as exc:
+        cleanup_download({"download_path": str(download_path)})
+        update_job(
+            job["id"],
+            {
+                "status": "failed",
+                "finished_at": iso_now(),
+                "image_count": count_pngs(job_sample_dir(job) / "images"),
+                "error": f"Error de descarga: {exc}",
+            },
+        )
+    finally:
+        with lock:
+            download_running = False
+            current_download_job_id = None
+            if stop_requested and not processing_running:
+                stop_requested = False
+        run_download_queue()
 
-    if not reserve_virushare_slot(job["id"]):
+
+def process_downloaded_job(job: dict) -> None:
+    global current_process, processing_running, stop_requested
+    sample_hash = job["hash"]
+    sample_dir = job_sample_dir(job)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    download_path = Path(job.get("download_path") or job_download_path(job))
+    with lock:
+        jobs = read_jobs()
+        latest = next((item for item in jobs if item["id"] == job["id"]), job)
+        should_stop = stop_requested or latest.get("status") == "stopped"
+    if should_stop:
+        cleanup_download({"download_path": str(download_path)})
         update_job(
             job["id"],
             {
@@ -571,16 +717,17 @@ def process_job(job: dict) -> None:
             },
         )
         with lock:
-            running = False
-            stop_requested = False
+            processing_running = False
+            if stop_requested and not download_running:
+                stop_requested = False
         return
-    update_job(job["id"], {"status": "running", "error": None})
+    options = processing_options()
+    update_job(job["id"], {"status": "processing", "process_started_at": iso_now(), "error": None})
     env = os.environ.copy()
-    env["VIRUSHARE_API_KEY"] = virushare_api_key()
     env["IMAGE_ALGORITHMS"] = ",".join(options["selected_image_algorithms"])
     env["SAMPLE_OUTPUT_DIR"] = str(sample_dir)
     process = subprocess.Popen(
-        [sys.executable, "/lab/worker/process_sample.py", sample_hash],
+        [sys.executable, "/lab/worker/process_sample.py", "--process-archive", sample_hash, str(download_path)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
@@ -600,12 +747,13 @@ def process_job(job: dict) -> None:
             "error": "Detenido por usuario." if stopped else (None if code == 0 else f"El worker termino con codigo {code}."),
         },
     )
+    cleanup_download({"download_path": str(download_path)})
     with lock:
-        running = False
-        if stopped:
+        processing_running = False
+        if stopped and not download_running:
             stop_requested = False
     if not stopped:
-        run_queue()
+        run_process_queue()
 
 
 def page() -> str:
@@ -630,9 +778,11 @@ def page() -> str:
     button:disabled{opacity:.55;cursor:wait}
     .hint,.status{color:#667085;font-size:13px;line-height:1.45}.actions{display:flex;align-items:center;gap:10px;margin-top:12px}
     table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #d8dde5;padding:10px 8px;text-align:left;vertical-align:top}
-    th{color:#667085;font-size:12px;text-transform:uppercase}code{font-family:Consolas,monospace;font-size:12px}
+    th{color:#667085;font-size:12px;text-transform:uppercase;background:#fff;position:sticky;top:0;z-index:1}code{font-family:Consolas,monospace;font-size:12px}
+    .jobs-box{max-height:320px;overflow:auto;border:1px solid #d8dde5;border-radius:6px;background:#fff;margin-top:12px}
+    .jobs-box table{margin:0}.jobs-box tr:last-child td{border-bottom:0}.jobs-box code{overflow-wrap:anywhere}
     .pill{display:inline-flex;align-items:center;height:24px;border-radius:999px;padding:0 9px;font-size:12px;font-weight:700}
-    .queued{background:#e5e7eb;color:#374151}.waiting_rate_limit{background:#fef3c7;color:#92400e}.running{background:#dbeafe;color:#1d4ed8}.completed{background:#dcfce7;color:#15803d}.skipped{background:#e0f2fe;color:#0369a1}.failed{background:#fee2e2;color:#b42318}.stopped{background:#f3f4f6;color:#4b5563}
+    .queued{background:#e5e7eb;color:#374151}.waiting_rate_limit{background:#fef3c7;color:#92400e}.downloading{background:#dbeafe;color:#1d4ed8}.downloaded{background:#ede9fe;color:#6d28d9}.processing{background:#d1fae5;color:#047857}.running{background:#dbeafe;color:#1d4ed8}.completed{background:#dcfce7;color:#15803d}.skipped{background:#e0f2fe;color:#0369a1}.failed{background:#fee2e2;color:#b42318}.stopped{background:#f3f4f6;color:#4b5563}
     .secondary{background:#4b5563}.danger{background:#b42318}
     .check{display:flex;align-items:center;gap:8px;margin:8px 0;color:#344054}
     input[type=checkbox]{width:auto;height:auto;margin:0}
@@ -667,8 +817,8 @@ def page() -> str:
       <input id="apiKey" type="password" placeholder="VirusShare API key">
       <div class="actions"><button id="saveApiKey">Guardar key</button><span class="hint" id="configHint"></span></div>
       <p class="hint" id="configStatus">Revisando configuracion...</p>
-      <label class="check"><input id="skipProcessedHash" type="checkbox"> Saltar hash si ya tiene resultados</label>
-      <p class="hint">Saltar evita consultar VirusShare para hashes ya procesados.</p>
+      <label class="check"><input id="skipProcessedHash" type="checkbox" checked disabled> Verificar hashes ya analizados</label>
+      <p class="hint">La verificacion se hace antes de usar la cuota de VirusShare.</p>
       <h2>Imagenes</h2>
       <p class="hint">En cada lote se generan solo los tipos marcados.</p>
       <label class="check"><input class="imageAlgorithm" data-algorithm="markov" type="checkbox"> Markov</label>
@@ -697,10 +847,10 @@ def page() -> str:
     async function api(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error(await r.text());return r.json()}
     function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
     function pill(s){return '<span class="pill '+s+'">'+s+'</span>'}
-    async function refreshConfig(){const d=await api('/api/config');document.querySelector('#configStatus').textContent=(d.has_virushare_api_key?'VirusShare API key configurada.':'VirusShare API key no configurada.')+' Intervalo: '+d.virushare_interval_seconds+'s.';document.querySelector('#skipProcessedHash').checked=!!d.skip_processed_hash;const selected=new Set(d.selected_image_algorithms||[]);document.querySelectorAll('.imageAlgorithm').forEach(c=>{c.checked=selected.has(c.dataset.algorithm)})}
+    async function refreshConfig(){const d=await api('/api/config');document.querySelector('#configStatus').textContent=(d.has_virushare_api_key?'VirusShare API key configurada.':'VirusShare API key no configurada.')+' Intervalo: '+d.virushare_interval_seconds+'s.';document.querySelector('#skipProcessedHash').checked=true;const selected=new Set(d.selected_image_algorithms||[]);document.querySelectorAll('.imageAlgorithm').forEach(c=>{c.checked=selected.has(c.dataset.algorithm)})}
     async function refreshBatches(){const d=await api('/api/batches');const selected=existingBatch.value;existingBatch.innerHTML='<option value="">Crear lote nuevo</option>'+d.batches.map(b=>'<option value="'+b.name+'">'+b.name+'</option>').join('');existingBatch.value=selected}
     document.querySelector('#saveApiKey').addEventListener('click',async()=>{const key=document.querySelector('#apiKey').value.trim();const ch=document.querySelector('#configHint');if(!key){ch.textContent='Pega una API key primero.';return}await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({virushare_api_key:key})});document.querySelector('#apiKey').value='';ch.textContent='Key guardada localmente.';await refreshConfig()});
-    document.querySelector('#saveOptions').addEventListener('click',async()=>{const selected=[];document.querySelectorAll('.imageAlgorithm').forEach(c=>{if(c.checked)selected.push(c.dataset.algorithm)});if(!selected.length){optionsHint.textContent='Marca al menos un tipo de imagen.';return}await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({skip_processed_hash:document.querySelector('#skipProcessedHash').checked,selected_image_algorithms:selected})});optionsHint.textContent='Opciones guardadas.';await refreshConfig()});
+    document.querySelector('#saveOptions').addEventListener('click',async()=>{const selected=[];document.querySelectorAll('.imageAlgorithm').forEach(c=>{if(c.checked)selected.push(c.dataset.algorithm)});if(!selected.length){optionsHint.textContent='Marca al menos un tipo de imagen.';return}await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({skip_processed_hash:true,selected_image_algorithms:selected})});optionsHint.textContent='Opciones guardadas.';await refreshConfig()});
     document.querySelector('#hashFile').addEventListener('change',async(e)=>{const f=e.target.files[0];if(!f)return;document.querySelector('#hashes').value=await f.text();hint.textContent='Archivo cargado: '+f.name});
     document.querySelector('#stopJobs').addEventListener('click',async()=>{jobsHint.textContent='Deteniendo...';try{await api('/api/control/stop',{method:'POST'});jobsHint.textContent='Procesamiento detenido.';await refresh()}catch(e){jobsHint.textContent=e.message}});
     document.querySelector('#shutdownLab').addEventListener('click',async()=>{if(!confirm('Esto terminara el servidor del laboratorio. Puedes volver a iniciarlo con start_lab_docker.cmd.'))return;jobsHint.textContent='Terminando laboratorio...';try{await api('/api/control/shutdown',{method:'POST'});jobsHint.textContent='Laboratorio detenido.'}catch(e){jobsHint.textContent=e.message}});
@@ -709,8 +859,9 @@ def page() -> str:
     function fmtSeconds(s){s=Math.max(0,Math.floor(s||0));const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return (h?h+'h ':'')+(m||h?m+'m ':'')+sec+'s'}
     function fmtEpoch(e){return e?new Date(e*1000).toLocaleString():'-'}
     function renderSummary(s){if(!s){summaryEl.innerHTML='';return}summaryEl.innerHTML='<div class="summary"><div class="metric"><span>Inicio</span><strong>'+fmtEpoch(s.started_at)+'</strong></div><div class="metric"><span>Restante</span><strong>'+fmtSeconds(s.remaining_seconds)+'</strong></div><div class="metric"><span>Final estimado</span><strong>'+fmtEpoch(s.estimated_finish_at)+'</strong></div><div class="metric"><span>Progreso</span><strong>'+s.completed+'/'+s.total+' ok, '+s.skipped+' saltados, '+s.failed+' fallidos</strong></div></div>'}
-    async function refresh(){const d=await api('/api/jobs');renderSummary(d.batch_summary);if(!d.jobs.length){jobsEl.innerHTML='<p class="hint">Sin trabajos todavia.</p>';detailsEl.innerHTML='';return}
-      jobsEl.innerHTML='<table><thead><tr><th>Lote</th><th>Hash</th><th>Estado</th><th>Imagenes</th><th>Actualizado</th></tr></thead><tbody>'+d.jobs.map(j=>'<tr><td>'+((j.batch_name||j.batch_dir)||'-')+'</td><td><a href="#" data-job-id="'+j.id+'"><code>'+j.hash+'</code></a></td><td>'+pill(j.status)+'</td><td>'+j.image_count+'</td><td>'+new Date(j.updated_at).toLocaleString()+'</td></tr>').join('')+'</tbody></table>';
+    async function refresh(){const d=await api('/api/jobs');renderSummary(d.batch_summary);if(!d.jobs.length){jobsEl.innerHTML='<div class="jobs-box"><p class="hint">Sin trabajos todavia.</p></div>';detailsEl.innerHTML='';return}
+      const table='<table><thead><tr><th>Lote</th><th>Hash</th><th>Estado</th><th>Imagenes</th><th>Actualizado</th></tr></thead><tbody>'+d.jobs.map(j=>'<tr><td>'+((j.batch_name||j.batch_dir)||'-')+'</td><td><a href="#" data-job-id="'+j.id+'"><code>'+j.hash+'</code></a></td><td>'+pill(j.status)+'</td><td>'+j.image_count+'</td><td>'+new Date(j.updated_at).toLocaleString()+'</td></tr>').join('')+'</tbody></table>';
+      jobsEl.innerHTML='<div class="jobs-box">'+table+'</div>';
       jobsEl.querySelectorAll('a[data-job-id]').forEach(l=>l.addEventListener('click',e=>{e.preventDefault();selectedJobId=l.dataset.jobId;loadDetails(selectedJobId)}));if(selectedJobId)loadDetails(selectedJobId)}
     function fmtTimestamp(ts){const n=Number(ts);if(!Number.isFinite(n)||n<=0)return '-';return new Date(n*1000).toLocaleString()+' UTC'}
     function fmtCreateDate(v){if(!v)return '';const m=String(v).match(/^(\\d{4}):(\\d{2}):(\\d{2}) (\\d{2}:\\d{2}:\\d{2})/);return m?m[1]+'-'+m[2]+'-'+m[3]+' '+m[4]:String(v)}
@@ -739,7 +890,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             return self.send_text(page(), "text/html; charset=utf-8")
         if self.path == "/api/jobs":
-            jobs = read_jobs()
+            jobs = sort_jobs_recent_first(read_jobs())
             return self.send_json({"jobs": jobs, "batch_summary": batch_summary(jobs)})
         if self.path == "/api/config":
             return self.send_json(public_config())

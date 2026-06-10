@@ -62,8 +62,19 @@ La UI permite:
 - Detener el procesamiento activo.
 - Limpiar la lista de trabajos sin borrar carpetas de lotes.
 - Terminar el laboratorio.
-- Saltar hashes que ya tengan resultados en el lote seleccionado.
+- Verificar automaticamente hashes que ya tengan resultados completos en el lote seleccionado antes de usar la cuota de VirusShare.
 - Elegir que imagenes generar: `markov`, `simhash`, `bigram_dct`, `bin2rgb`, `wem`.
+
+## Flujo inteligente de trabajos
+
+Al crear un lote, el servidor revisa primero cada hash contra la carpeta destino. Si ya existen resultados completos, el trabajo queda como `skipped` inmediatamente y no consume espera ni solicitud de VirusShare.
+
+Los hashes nuevos usan dos colas separadas:
+
+- Cola de descarga: respeta la cuota de VirusShare y solicita como maximo una muestra cada 16 segundos.
+- Cola de procesamiento: convierte a PNG y ejecuta analisis estatico/de imagen cuando el ZIP temporal ya esta disponible.
+
+Esto permite que el laboratorio descargue la siguiente muestra mientras la anterior todavia se esta transformando. Los ZIPs descargados se guardan solo en un directorio temporal interno del contenedor y se eliminan al terminar o detener el trabajo.
 
 ## Salidas
 
@@ -87,7 +98,7 @@ data/
       metadata.json
 ```
 
-El binario y el ZIP se usan solo como temporales dentro del contenedor. Al finalizar, el worker elimina el directorio temporal completo.
+El binario y el ZIP se usan solo como temporales dentro del contenedor. Al finalizar, el worker elimina el directorio temporal completo. La carpeta `data/` no debe recibir binarios, ZIPs, muestras originales ni `worker.log`.
 
 ## Analisis estatico
 

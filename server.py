@@ -218,6 +218,16 @@ def count_pngs(path: Path) -> int:
     return len(list(path.rglob("*.png")))
 
 
+def has_any_png(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        next(path.rglob("*.png"))
+        return True
+    except StopIteration:
+        return False
+
+
 def job_sample_dir(job: dict) -> Path:
     sample_dir = job.get("sample_dir")
     if sample_dir:
@@ -391,15 +401,27 @@ def has_sample_results(job: dict) -> bool:
     if metadata_path.exists():
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if metadata.get("status") == "completed" and count_pngs(sample_dir / "images") > 0:
+            if metadata.get("status") == "completed" and int(metadata.get("image_count") or 0) > 0:
                 return True
         except Exception:
             pass
     return (
-        count_pngs(sample_dir / "images") > 0
+        has_any_png(sample_dir / "images")
         and (sample_dir / "analysis" / "static_analysis.json").exists()
         and (sample_dir / "analysis" / "image_analysis.json").exists()
     )
+
+
+def existing_image_count(job: dict) -> int:
+    sample_dir = job_sample_dir(job)
+    metadata_path = sample_dir / "metadata.json"
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            return int(metadata.get("image_count") or 0)
+        except Exception:
+            pass
+    return 1 if has_any_png(sample_dir / "images") else 0
 
 
 def batch_summary(jobs: list[dict]) -> dict | None:
@@ -496,17 +518,11 @@ def create_jobs(hashes: list[str], batch_name: str, append_batch: str = "") -> l
         }
         for index, sample_hash in enumerate(hashes)
     ]
-    for job in created:
-        if has_sample_results(job):
-            job["status"] = "skipped"
-            job["finished_at"] = now
-            job["image_count"] = count_pngs(job_sample_dir(job) / "images")
-            job["error"] = "Saltado antes de cuota: el hash ya tiene resultados completos en este lote."
     with lock:
         stop_requested = False
         jobs = read_jobs()
         write_jobs(created + jobs)
-        download_queue.extend(job["id"] for job in created if job["status"] == "queued")
+        download_queue.extend(job["id"] for job in created)
     run_download_queue()
     run_process_queue()
     return created
@@ -627,6 +643,18 @@ def download_job(job: dict) -> None:
     sample_hash = job["hash"]
     download_path = job_download_path(job)
     try:
+        update_job(job["id"], {"status": "checking_existing", "error": "Verificando resultados existentes."})
+        if has_sample_results(job):
+            update_job(
+                job["id"],
+                {
+                    "status": "skipped",
+                    "finished_at": iso_now(),
+                    "image_count": existing_image_count(job),
+                    "error": "Saltado antes de cuota: el hash ya tiene resultados completos en este lote.",
+                },
+            )
+            return
         if not reserve_virushare_slot(job["id"]):
             update_job(
                 job["id"],
@@ -782,7 +810,7 @@ def page() -> str:
     .jobs-box{max-height:320px;overflow:auto;border:1px solid #d8dde5;border-radius:6px;background:#fff;margin-top:12px}
     .jobs-box table{margin:0}.jobs-box tr:last-child td{border-bottom:0}.jobs-box code{overflow-wrap:anywhere}
     .pill{display:inline-flex;align-items:center;height:24px;border-radius:999px;padding:0 9px;font-size:12px;font-weight:700}
-    .queued{background:#e5e7eb;color:#374151}.waiting_rate_limit{background:#fef3c7;color:#92400e}.downloading{background:#dbeafe;color:#1d4ed8}.downloaded{background:#ede9fe;color:#6d28d9}.processing{background:#d1fae5;color:#047857}.running{background:#dbeafe;color:#1d4ed8}.completed{background:#dcfce7;color:#15803d}.skipped{background:#e0f2fe;color:#0369a1}.failed{background:#fee2e2;color:#b42318}.stopped{background:#f3f4f6;color:#4b5563}
+    .queued{background:#e5e7eb;color:#374151}.checking_existing{background:#f1f5f9;color:#475569}.waiting_rate_limit{background:#fef3c7;color:#92400e}.downloading{background:#dbeafe;color:#1d4ed8}.downloaded{background:#ede9fe;color:#6d28d9}.processing{background:#d1fae5;color:#047857}.running{background:#dbeafe;color:#1d4ed8}.completed{background:#dcfce7;color:#15803d}.skipped{background:#e0f2fe;color:#0369a1}.failed{background:#fee2e2;color:#b42318}.stopped{background:#f3f4f6;color:#4b5563}
     .secondary{background:#4b5563}.danger{background:#b42318}
     .check{display:flex;align-items:center;gap:8px;margin:8px 0;color:#344054}
     input[type=checkbox]{width:auto;height:auto;margin:0}

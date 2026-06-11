@@ -76,6 +76,14 @@ Los hashes nuevos usan dos colas separadas:
 
 Esto permite que el laboratorio descargue la siguiente muestra mientras la anterior todavia se esta transformando. Los ZIPs descargados se guardan solo en un directorio temporal interno del contenedor y se eliminan al terminar o detener el trabajo.
 
+Tambien puedes filtrar una lista completa antes de pegarla en la UI:
+
+```powershell
+.\scripts\hashes_restantes.ps1 -Lista .\hashes_completos.txt -CarpetaObjetivo .\data\img -Salida .\tmp\hashes_restantes.txt
+```
+
+`-CarpetaObjetivo` debe apuntar al lote donde ya existen resultados, por ejemplo `data\img`. El script compara cada hash contra `data\<lote>\<hash>\` y devuelve solo los hashes que faltan. Por defecto considera completo un hash con `metadata.json` en estado `completed` e imagenes generadas, o con imagenes mas `analysis/static_analysis.json` y `analysis/image_analysis.json`.
+
 ## Salidas
 
 Cada hash genera una carpeta con esta estructura:
